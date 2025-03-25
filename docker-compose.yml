@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  # OSRM routing engine for Munich
+  osrm:
+    image: osrm/osrm-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data/osrm:/data
+    command: osrm-routed --algorithm mld /data/munich.osrm
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/route/v1/driving/11.5,48.1;11.6,48.2" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      - OSRM_MAX_TABLE_SIZE=2000
+
+  # OpenRouteService as an alternative routing engine
+  openrouteservice:
+    image: openrouteservice/openrouteservice
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/ors:/data
+    restart: unless-stopped
+    environment:
+      - ORS_CONFIG_LOCATION=/ors-conf/ors-config.json
+      - JAVA_OPTS=-Xms1g -Xmx2g
+
+  # MCP Routing service
+  mcp-routing:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - osrm
+    environment:
+      - ROUTING_ENGINE=osrm
+      - OSRM_ENDPOINT=http://osrm:5000
+      - ORS_ENDPOINT=http://openrouteservice:8080/ors
+      - DEEPSEEK_ENDPOINT=${DEEPSEEK_ENDPOINT:-http://host.docker.internal:8000/v1}
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env
