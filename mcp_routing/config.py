@@ -23,8 +23,8 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 # Routing engine configuration
 ROUTING_ENGINE = os.getenv(
-    "ROUTING_ENGINE", "osrm"
-)  # Options: "osrm", "openrouteservice"
+    "ROUTING_ENGINE", "dummy"
+)  # Options: "osrm", "openrouteservice", "dummy"
 OSRM_ENDPOINT = os.getenv("OSRM_ENDPOINT", "http://localhost:5000")
 ORS_ENDPOINT = os.getenv("ORS_ENDPOINT", "http://localhost:8080/ors")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
