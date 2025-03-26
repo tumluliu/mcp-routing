@@ -5,6 +5,7 @@ from typing import Tuple, Optional
 import time
 from loguru import logger
 from .config import MUNICH_BBOX
+import re
 
 
 class NominatimGeocoder:
@@ -59,6 +60,23 @@ class NominatimGeocoder:
                 queries.append("Munich Airport")
                 queries.append("Flughafen München")
                 queries.append("Munich International Airport")
+
+            # 6. Try to extract just the street address if a business name might be included
+            street_address = self._extract_street_address(location)
+            if street_address:
+                queries.append(street_address)
+                queries.append(f"{street_address}, {city}")
+                queries.append(f"{street_address}, {city}, Germany")
+
+            # 7. Special case for Huawei Research Center (handle name variations)
+            if "huawei" in location.lower() and any(
+                term in location.lower() for term in ["research", "center", "centre"]
+            ):
+                queries.append(
+                    "Huawei Technologies German Research Center, Riesstraße 25, Munich"
+                )
+                queries.append("Riesstraße 25, Munich")
+                queries.append("Riesstrasse 25, 80992 Munich, Germany")
 
             # Try each query until we get a result
             for query in queries:
@@ -130,3 +148,30 @@ class NominatimGeocoder:
         finally:
             # Respect Nominatim's usage policy by adding a delay
             time.sleep(1)
+
+    def _extract_street_address(self, location: str) -> Optional[str]:
+        """Extract street address from a location string that might include business name.
+
+        Args:
+            location: Location string (possibly containing business name and address)
+
+        Returns:
+            Street address part or None if no pattern is found
+        """
+        # Pattern to match German street addresses (e.g., "Streetname 123" or "Streetname 123a")
+        # Also matches postal codes (e.g., "80992") and cities
+        patterns = [
+            # Match "Streetname 123, City" or "Streetname 123, 12345 City"
+            r"([A-Za-zäöüÄÖÜß\s\.]+\s\d+[a-z]?)[,\s]+(?:\d{5}\s)?[A-Za-zäöüÄÖÜß\s]+",
+            # Match just "Streetname 123"
+            r"([A-Za-zäöüÄÖÜß\s\.]+\s\d+[a-z]?)",
+            # Match "12345 City, Streetname 123"
+            r"\d{5}\s[A-Za-zäöüÄÖÜß\s]+,\s([A-Za-zäöüÄÖÜß\s\.]+\s\d+[a-z]?)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, location)
+            if match:
+                return match.group(1)
+
+        return None

@@ -57,10 +57,61 @@ def create_route_map(
 
     # Add navigation instructions if available
     if instructions:
-        instructions_html = "<h4>Navigation Instructions</h4><ol>"
+        # Enhanced styling for navigation instructions
+        instructions_html = """
+        <div style="
+            padding: 15px; 
+            background-color: #f8f9fa; 
+            border-radius: 8px; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            font-family: Arial, sans-serif;
+            max-height: 300px;
+            overflow-y: auto;
+            margin: 10px 0;
+        ">
+            <h4 style="
+                color: #3366cc; 
+                border-bottom: 1px solid #e1e4e8; 
+                padding-bottom: 8px; 
+                margin-top: 0;
+            ">Navigation Instructions</h4>
+            <ol style="
+                padding-left: 25px;
+                margin: 10px 0;
+            ">
+        """
+
         for i, instruction in enumerate(instructions):
-            instructions_html += f"<li>{instruction}</li>"
-        instructions_html += "</ol>"
+            # Add different styling for different types of instructions (turn, continue, arrive)
+            icon = "➡️"  # Default icon
+
+            if any(kw in instruction.lower() for kw in ["turn left", "left onto"]):
+                icon = "↩️"
+            elif any(kw in instruction.lower() for kw in ["turn right", "right onto"]):
+                icon = "↪️"
+            elif any(kw in instruction.lower() for kw in ["straight", "continue"]):
+                icon = "⬆️"
+            elif any(kw in instruction.lower() for kw in ["destination", "arrive"]):
+                icon = "🏁"
+            elif any(kw in instruction.lower() for kw in ["uturn", "u-turn"]):
+                icon = "↩️↩️"
+            elif any(
+                kw in instruction.lower() for kw in ["merge", "highway", "motorway"]
+            ):
+                icon = "🛣️"
+
+            instructions_html += f"""
+            <li style="
+                margin-bottom: 8px;
+                line-height: 1.5;
+                color: #333;
+            "><span style="margin-right: 5px;">{icon}</span> {instruction}</li>
+            """
+
+        instructions_html += """
+            </ol>
+        </div>
+        """
 
         folium.Element(instructions_html).add_to(m)
 
@@ -92,9 +143,25 @@ def create_route_map(
     duration_min = route_data.get("duration", 0) / 60
 
     summary_html = f"""
-    <h4>Route Summary</h4>
-    <b>Distance:</b> {distance_km:.1f} km<br>
-    <b>Duration:</b> {duration_min:.0f} min<br>
+    <div style="
+        padding: 15px; 
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-family: Arial, sans-serif;
+        margin: 10px 0;
+    ">
+        <h4 style="
+            color: #3366cc;
+            border-bottom: 1px solid #e1e4e8;
+            padding-bottom: 8px;
+            margin-top: 0;
+        ">Route Summary</h4>
+        <div style="margin-top: 10px;">
+            <b>Distance:</b> {distance_km:.1f} km<br>
+            <b>Duration:</b> {duration_min:.0f} min<br>
+        </div>
+    </div>
     """
 
     folium.Element(summary_html).add_to(m)

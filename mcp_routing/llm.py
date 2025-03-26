@@ -348,7 +348,7 @@ class DeepSeekLLM:
 
                 logger.debug(f"Parsing JSON string: {json_str[:100]}...")
                 result = json.loads(json_str)
-                logger.info(f"Successfully parsed routing query: {list(result.keys())}")
+                logger.info(f"Successfully parsed routing query: {result}")
                 return result
             except (json.JSONDecodeError, IndexError) as e:
                 logger.error(f"Failed to parse LLM response as JSON: {str(e)}")
