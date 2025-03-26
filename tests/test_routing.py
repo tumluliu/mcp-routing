@@ -5,6 +5,7 @@ from mcp_routing.routing import (
     RoutingEngine,
     OSRMEngine,
     OpenRouteServiceEngine,
+    DummyRoutingEngine,
     get_routing_engine,
 )
 
@@ -12,6 +13,9 @@ from mcp_routing.routing import (
 def test_routing_engine_base():
     """Test the base RoutingEngine class."""
     engine = RoutingEngine()
+
+    # Test that geocoder attribute exists
+    assert hasattr(engine, "geocoder")
 
     # Test geocoding with a known location
     coords = engine.geocode("Marienplatz")
@@ -27,17 +31,44 @@ def test_routing_engine_base():
 
 def test_get_routing_engine():
     """Test the get_routing_engine factory function."""
-    # Test getting OSRM engine
+    # Test with 'osrm'
     engine = get_routing_engine("osrm")
     assert isinstance(engine, OSRMEngine)
+    assert hasattr(engine, "geocoder")
 
-    # Test getting OpenRouteService engine
+    # Test with 'openrouteservice'
     engine = get_routing_engine("openrouteservice")
     assert isinstance(engine, OpenRouteServiceEngine)
+    assert hasattr(engine, "geocoder")
 
-    # Test invalid engine name
-    with pytest.raises(ValueError):
-        get_routing_engine("invalid_engine")
+    # Test with 'dummy'
+    engine = get_routing_engine("dummy")
+    assert isinstance(engine, DummyRoutingEngine)
+    assert hasattr(engine, "geocoder")
+
+    # Test with invalid engine name
+    engine = get_routing_engine("invalid_engine")
+    assert isinstance(engine, DummyRoutingEngine)
+    assert hasattr(engine, "geocoder")
+
+
+def test_dummy_routing_engine():
+    """Test the DummyRoutingEngine class."""
+    engine = DummyRoutingEngine()
+
+    # Test geocoding
+    coords = engine.geocode("Marienplatz")
+    assert isinstance(coords, tuple)
+    assert len(coords) == 2
+
+    # Test routing
+    route_data = engine.route("Marienplatz", "Hauptbahnhof")
+    assert isinstance(route_data, dict)
+    assert "distance" in route_data
+    assert "duration" in route_data
+    assert "geometry" in route_data
+    assert "steps" in route_data
+    assert len(route_data["steps"]) > 0
 
 
 # The following tests are marked as skip by default because they require

@@ -14,10 +14,16 @@ from .config import (
     ORS_API_KEY,
     MUNICH_BBOX,
 )
+from .geocoding import NominatimGeocoder
 
 
 class RoutingEngine:
     """Base class for routing engines."""
+
+    def __init__(self):
+        """Initialize the routing engine."""
+        self.geocoder = NominatimGeocoder()
+        logger.info("Initialized RoutingEngine with NominatimGeocoder")
 
     def geocode(self, location: str) -> Tuple[float, float]:
         """Convert a location string to coordinates.
@@ -28,12 +34,17 @@ class RoutingEngine:
         Returns:
             (latitude, longitude) tuple
         """
-        # In a real implementation, this would use a geocoding service
-        # For this PoC, we'll use a simplified version that works with Munich's major locations
-
         logger.debug(f"Geocoding location: {location}")
 
-        # Dictionary of known Munich locations
+        # Try to geocode using Nominatim
+        coords = self.geocoder.geocode(location)
+        if coords:
+            return coords
+
+        # If Nominatim fails, fall back to hardcoded locations
+        logger.warning(f"Falling back to hardcoded locations for: {location}")
+
+        # Dictionary of known Munich locations (as fallback)
         munich_locations = {
             "marienplatz": (48.1373, 11.5754),
             "hauptbahnhof": (48.1402, 11.5600),
@@ -63,7 +74,9 @@ class RoutingEngine:
         # Check for exact matches
         for name, coords in munich_locations.items():
             if name in location_lower or location_lower in name:
-                logger.debug(f"Location match found: {name} -> {coords}")
+                logger.debug(
+                    f"Location match found in hardcoded list: {name} -> {coords}"
+                )
                 return coords
 
         # If no match found, generate a pseudo-random point in Munich's bounding box
@@ -87,7 +100,7 @@ class RoutingEngine:
             MUNICH_BBOX["max_lon"] - MUNICH_BBOX["min_lon"]
         )
 
-        logger.debug(
+        logger.warning(
             f"No exact match found for '{location}'. Generated coordinates: ({lat}, {lon})"
         )
         return (lat, lon)
@@ -114,6 +127,7 @@ class OSRMEngine(RoutingEngine):
         Args:
             endpoint: OSRM API endpoint
         """
+        super().__init__()
         self.endpoint = endpoint
         logger.info(f"Initialized OSRM engine with endpoint: {endpoint}")
 
@@ -281,6 +295,7 @@ class OpenRouteServiceEngine(RoutingEngine):
             endpoint: OpenRouteService API endpoint
             api_key: OpenRouteService API key
         """
+        super().__init__()
         self.endpoint = endpoint
         self.api_key = api_key
         self.headers = {
@@ -499,11 +514,12 @@ def get_routing_engine(engine_name: str = ROUTING_ENGINE) -> RoutingEngine:
         return DummyRoutingEngine()
 
 
-class DummyRoutingEngine:
+class DummyRoutingEngine(RoutingEngine):
     """Dummy routing engine that returns fake data when actual routing engines fail."""
 
     def __init__(self):
         """Initialize the dummy routing engine."""
+        super().__init__()
         logger.warning(
             "Initializing DummyRoutingEngine. This should only be used for testing."
         )
@@ -517,8 +533,20 @@ class DummyRoutingEngine:
         Returns:
             (latitude, longitude) tuple
         """
-        # Use the same implementation as the base RoutingEngine class
-        logger.debug(f"DummyRoutingEngine geocoding: {location}")
+        # First try using Nominatim via the base class
+        try:
+            coords = super().geocode(location)
+            logger.debug(
+                f"Successfully geocoded '{location}' using Nominatim: {coords}"
+            )
+            return coords
+        except Exception as e:
+            logger.warning(
+                f"Failed to geocode with Nominatim: {str(e)}. Using fallback method."
+            )
+
+        # If Nominatim fails, use the fallback implementation
+        logger.debug(f"DummyRoutingEngine fallback geocoding: {location}")
 
         # Munich center coordinates (Marienplatz)
         munich_center = [48.1371, 11.5754]

@@ -14,6 +14,7 @@ import shutil
 import traceback
 from pathlib import Path
 from loguru import logger
+import marked
 
 # Configure loguru
 logger.remove()  # Remove default handler
@@ -220,6 +221,7 @@ async def root():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Munich Route Planner</title>
         <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap">
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
             :root {
                 --primary-color: #0069c0;
@@ -376,6 +378,75 @@ async def root():
                 border-radius: var(--radius);
                 max-width: 80%;
                 animation: fadeIn 0.3s ease;
+            }
+            
+            .message-content {
+                line-height: 1.5;
+            }
+            
+            .message-content p {
+                margin: 0.5em 0;
+            }
+            
+            .message-content ul, .message-content ol {
+                margin: 0.5em 0;
+                padding-left: 1.5em;
+            }
+            
+            .message-content li {
+                margin: 0.3em 0;
+            }
+            
+            .message-content code {
+                background-color: rgba(0, 0, 0, 0.1);
+                padding: 0.2em 0.4em;
+                border-radius: 3px;
+                font-family: monospace;
+            }
+            
+            .message-content pre {
+                background-color: rgba(0, 0, 0, 0.1);
+                padding: 1em;
+                border-radius: var(--radius);
+                overflow-x: auto;
+                margin: 0.5em 0;
+            }
+            
+            .message-content pre code {
+                background-color: transparent;
+                padding: 0;
+            }
+            
+            .message-content blockquote {
+                border-left: 3px solid var(--primary-color);
+                margin: 0.5em 0;
+                padding-left: 1em;
+                color: var(--text-secondary);
+            }
+            
+            .message-content table {
+                border-collapse: collapse;
+                width: 100%;
+                margin: 0.5em 0;
+            }
+            
+            .message-content th, .message-content td {
+                border: 1px solid var(--gray-medium);
+                padding: 0.5em;
+                text-align: left;
+            }
+            
+            .message-content th {
+                background-color: var(--gray-light);
+            }
+            
+            .message-content a {
+                color: var(--primary-color);
+                text-decoration: none;
+            }
+            
+            .message-content a:hover {
+                text-decoration: underline;
             }
             
             @keyframes fadeIn {
@@ -742,11 +813,16 @@ async def root():
                     // Add caption if there's text
                     if (text && text.trim()) {
                         const textElement = document.createElement('div');
-                        textElement.innerHTML = text;
+                        textElement.className = 'message-content';
+                        textElement.innerHTML = marked.parse(text);
                         messageDiv.appendChild(textElement);
                     }
                 } else {
-                    messageDiv.innerHTML = text;
+                    // Create content div for markdown rendering
+                    const contentDiv = document.createElement('div');
+                    contentDiv.className = 'message-content';
+                    contentDiv.innerHTML = marked.parse(text);
+                    messageDiv.appendChild(contentDiv);
                 }
                 
                 chatContainer.appendChild(messageDiv);

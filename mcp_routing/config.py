@@ -30,7 +30,7 @@ ORS_ENDPOINT = os.getenv("ORS_ENDPOINT", "http://localhost:8080/ors")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 
 # Munich bounding box (approx)
-MUNICH_BBOX = {"min_lat": 48.0, "max_lat": 48.3, "min_lon": 11.3, "max_lon": 11.8}
+MUNICH_BBOX = {"min_lat": 47.5, "max_lat": 48.8, "min_lon": 10.3, "max_lon": 13.0}
 
 # Service configuration
 SERVICE_HOST = os.getenv("SERVICE_HOST", "0.0.0.0")

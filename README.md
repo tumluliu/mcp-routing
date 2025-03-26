@@ -67,7 +67,7 @@ wget https://download.geofabrik.de/europe/germany/bayern/oberbayern-latest.osm.p
 docker run -t -v "${PWD}/data/osrm:/data" osrm/osrm-backend osrm-extract -p /opt/car.lua /data/munich.osm.pbf
 docker run -t -v "${PWD}/data/osrm:/data" osrm/osrm-backend osrm-partition /data/munich.osrm
 docker run -t -v "${PWD}/data/osrm:/data" osrm/osrm-backend osrm-customize /data/munich.osrm
-docker run -t -i -p 5000:5000 -v "${PWD}/data/osrm:/data" osrm/osrm-backend osrm-routed --algorithm mld /data/munich.osrm
+docker run -t -i -p 5001:5000 -v "${PWD}/data/osrm:/data" osrm/osrm-backend osrm-routed --algorithm mld /data/munich.osrm
 ```
 
 ### OpenRouteService

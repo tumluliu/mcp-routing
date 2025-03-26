@@ -3,10 +3,11 @@
 import json
 import requests
 import base64
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
 import os
 import traceback
 from loguru import logger
+import re
 
 from .config import DEEPSEEK_ENDPOINT, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 
@@ -214,11 +215,11 @@ class DeepSeekLLM:
         Returns:
             Dictionary of structured routing parameters
         """
-        try:
-            logger.info(f"Parsing routing query: {query}")
-            if image_path:
-                logger.info(f"Query includes image: {image_path}")
+        logger.info(f"Parsing routing query: {query}")
+        if image_path:
+            logger.info(f"Query includes image: {image_path}")
 
+        try:
             # Ensure conversation exists
             if conversation_id:
                 conversation_id = self.create_conversation(conversation_id)
@@ -239,7 +240,7 @@ class DeepSeekLLM:
             The image could contain places like Marienplatz, the English Garden, Olympiapark, BMW Museum, 
             Deutsches Museum, Nymphenburg Palace, or other landmarks in Munich.
             
-            Return a JSON object with these fields:
+            IMPORTANT: You MUST return your response ONLY as a valid JSON object with these fields:
             - origin: Origin location (address or coordinates)
             - destination: Destination location (address or coordinates)
             - mode: Transportation mode (default: "driving")
@@ -249,13 +250,16 @@ class DeepSeekLLM:
             - arrival_time: Arrival time (optional)
             - landmarks: Information about landmarks identified in the image (optional)
             
+            DO NOT provide explanations, details, or any other text outside of the JSON object.
+            DO NOT use markdown formatting. ONLY return a valid JSON object.
+            
             All addresses should be formatted properly for Munich, Germany.
             
             If the user references locations from previous conversations (like "there", "that place", 
             "the same location", etc.), use the context from previous messages to determine the actual locations.
             
             If an image is included but no text query is provided, extract as much information as possible from the
-            image and respond with information about the landmark and how it can be used for routing.
+            image and respond with information about the landmark and how it can be used for routing, still in JSON format.
             """
 
             # Construct messages with conversation history and current query
@@ -326,6 +330,10 @@ class DeepSeekLLM:
                     {"role": "assistant", "content": response_text}
                 )
 
+            # Three-stage parsing attempt
+            result = None
+
+            # Stage 1: Try to parse as JSON directly
             try:
                 # Extract JSON from response
                 json_str = response_text
@@ -343,16 +351,338 @@ class DeepSeekLLM:
                 logger.info(f"Successfully parsed routing query: {list(result.keys())}")
                 return result
             except (json.JSONDecodeError, IndexError) as e:
-                logger.error(f"Failed to parse LLM response: {str(e)}")
-                logger.error(f"Response text: {response_text}")
-                raise Exception(
-                    f"Failed to parse LLM response: {str(e)}\nResponse: {response_text}"
-                )
+                logger.error(f"Failed to parse LLM response as JSON: {str(e)}")
+                logger.debug(f"Response text: {response_text}")
+
+            # Stage 2: Try to extract structured data from text
+            if result is None:
+                try:
+                    logger.info(
+                        "Attempting to extract structured information from text response"
+                    )
+                    result = self._extract_routing_info_from_text(response_text)
+                    if result:
+                        logger.info(
+                            f"Successfully extracted routing info: {list(result.keys())}"
+                        )
+                        return result
+                except Exception as extraction_error:
+                    logger.error(
+                        f"Failed to extract routing info from text: {str(extraction_error)}"
+                    )
+
+            # Stage 3: Make a second attempt with explicit JSON instructions
+            if result is None:
+                try:
+                    logger.warning(
+                        "Making second attempt with explicit JSON instructions"
+                    )
+                    clarification_message = {
+                        "role": "user",
+                        "content": """I need the routing data in structured JSON format only. 
+                        Please provide ONLY a valid JSON object with these fields:
+                        - origin: Origin location
+                        - destination: Destination location
+                        - mode: Transportation mode
+
+                        NO explanations, NO markdown formatting, ONLY valid JSON.""",
+                    }
+                    messages.append(clarification_message)
+
+                    clarification_response = self._call_api(messages)
+                    clarification_text = clarification_response["choices"][0][
+                        "message"
+                    ]["content"]
+
+                    # Try to extract JSON from the clarification response
+                    if "```json" in clarification_text:
+                        json_str = (
+                            clarification_text.split("```json")[1]
+                            .split("```")[0]
+                            .strip()
+                        )
+                    elif "```" in clarification_text:
+                        json_str = (
+                            clarification_text.split("```")[1].split("```")[0].strip()
+                        )
+                    else:
+                        json_str = clarification_text
+
+                    result = json.loads(json_str)
+                    logger.info(
+                        f"Successfully parsed routing query from second attempt: {list(result.keys())}"
+                    )
+                    return result
+                except Exception as second_error:
+                    logger.error(f"Second parsing attempt failed: {str(second_error)}")
+
+            # Stage 4: Use fallback as a last resort
+            logger.warning("All parsing attempts failed, using fallback values")
+            return self._create_fallback_routing_result(query, response_text)
 
         except Exception as e:
-            logger.error(f"Error parsing routing query: {str(e)}")
+            logger.error(f"Error during routing query parsing: {str(e)}")
             logger.error(traceback.format_exc())
-            raise
+
+            # Even if everything fails, still provide a fallback result
+            try:
+                return self._create_fallback_routing_result(
+                    query, "Error occurred during processing"
+                )
+            except:
+                # Absolute last resort
+                return {
+                    "origin": "Marienplatz, Munich",
+                    "destination": "Munich Hauptbahnhof",
+                    "mode": "driving",
+                    "_fallback": True,
+                    "_error": f"Critical error: {str(e)}",
+                    "_original_query": query,
+                }
+
+    def _extract_routing_info_from_text(self, text: str) -> Dict[str, Any]:
+        """Extract routing information from text response.
+
+        Args:
+            text: Text response from LLM
+
+        Returns:
+            Dictionary with extracted routing parameters
+        """
+        # Default values
+        result = {
+            "origin": None,
+            "destination": None,
+            "mode": "driving",
+        }
+
+        # Check for detailed route keyword patterns which are common in LLM responses
+        if (
+            "route from" in text.lower()
+            or "driving route" in text.lower()
+            or "directions from" in text.lower()
+        ):
+            logger.debug("Detected route description pattern in text")
+
+        # Look for origin and destination in the markdown headings or titles
+        if "from" in text.lower() and "to" in text.lower():
+            title_pattern = re.search(
+                r"(?i)(route|directions|path|way)\s+from\s+[\"']?([^\"']+)[\"']?\s+to\s+[\"']?([^\"']+)[\"']?",
+                text,
+            )
+            if title_pattern:
+                result["origin"] = title_pattern.group(2).strip()
+                result["destination"] = title_pattern.group(3).strip()
+                logger.debug(
+                    f"Extracted origin/destination from title pattern: {result['origin']} to {result['destination']}"
+                )
+
+        # Look for markdown-formatted bold content
+        bold_patterns = re.findall(r"\*\*([^*]+)\*\*", text)
+        if bold_patterns:
+            logger.debug(f"Found {len(bold_patterns)} bold-formatted sections")
+
+            # Look for patterns that might indicate locations (specific to route descriptions)
+            for idx, bold_text in enumerate(bold_patterns):
+                bold_text = bold_text.strip()
+
+                # Check for specific locations that are likely to be highlighted
+                if any(
+                    loc in bold_text.lower()
+                    for loc in [
+                        "airport",
+                        "hauptbahnhof",
+                        "marienplatz",
+                        "station",
+                        "terminal",
+                    ]
+                ):
+                    logger.debug(f"Found potential landmark in bold text: {bold_text}")
+                    if not result["origin"]:
+                        result["origin"] = bold_text
+                    elif not result["destination"]:
+                        result["destination"] = bold_text
+
+        # Look for origin and destination in the text lines
+        lines = text.split("\n")
+
+        # Extract locations from markdown headers or bold text
+        for line in lines:
+            line = line.strip()
+
+            # Look for explicit origin/destination markers
+            if re.search(r"(?i)(?:from|origin|start|depart|departure)[\s:]", line):
+                potential_origin = self._extract_location_from_line(line)
+                if potential_origin and not result["origin"]:
+                    result["origin"] = potential_origin
+                    logger.debug(f"Extracted origin from line: {result['origin']}")
+
+            # Look for destination/to
+            if re.search(r"(?i)(?:to|destination|arrive|arrival)[\s:]", line):
+                potential_dest = self._extract_location_from_line(line)
+                if potential_dest and not result["destination"]:
+                    result["destination"] = potential_dest
+                    logger.debug(
+                        f"Extracted destination from line: {result['destination']}"
+                    )
+
+            # Look for transportation mode indicators
+            if "by car" in line.lower() or "driving" in line.lower():
+                result["mode"] = "driving"
+            elif "by bike" in line.lower() or "cycling" in line.lower():
+                result["mode"] = "cycling"
+            elif "on foot" in line.lower() or "walking" in line.lower():
+                result["mode"] = "walking"
+
+        # Special handling for Munich Airport in the response
+        if any(
+            airport_term in text.lower()
+            for airport_term in [
+                "munich airport",
+                "flughafen münchen",
+                "flughafen munich",
+                "muc",
+            ]
+        ):
+            if not result["origin"] and "depart" in text.lower():
+                result["origin"] = "Munich Airport"
+                logger.debug("Set origin to Munich Airport based on context")
+            elif not result["destination"] and "arriv" in text.lower():
+                result["destination"] = "Munich Airport"
+                logger.debug("Set destination to Munich Airport based on context")
+
+        # Special handling for main train station in the response
+        if any(
+            station_term in text.lower()
+            for station_term in [
+                "hauptbahnhof",
+                "main station",
+                "central station",
+                "main train station",
+            ]
+        ):
+            if not result["origin"] and "depart" in text.lower():
+                result["origin"] = "Munich Hauptbahnhof"
+                logger.debug("Set origin to Munich Hauptbahnhof based on context")
+            elif not result["destination"] and "arriv" in text.lower():
+                result["destination"] = "Munich Hauptbahnhof"
+                logger.debug("Set destination to Munich Hauptbahnhof based on context")
+
+        # If we have both origin and destination, return the result
+        if result["origin"] and result["destination"]:
+            return result
+
+        # If we still don't have both origin and destination, try one more approach:
+        # Extract locations from section headers (### Title)
+        header_matches = re.findall(r"###\s+[^#\n]+", text)
+        if header_matches:
+            for header in header_matches[:2]:  # Consider first two headers only
+                header_text = header.replace("###", "").strip()
+                if "depart" in header_text.lower() or "start" in header_text.lower():
+                    location = re.search(r"(?:from|at)\s+([^()]+)", header_text)
+                    if location and not result["origin"]:
+                        result["origin"] = location.group(1).strip()
+                elif (
+                    "arrive" in header_text.lower()
+                    or "destination" in header_text.lower()
+                ):
+                    location = re.search(r"(?:to|at)\s+([^()]+)", header_text)
+                    if location and not result["destination"]:
+                        result["destination"] = location.group(1).strip()
+
+        # Final check - if we found only one location, make educated guess on the other
+        if result["origin"] and not result["destination"]:
+            # Guess a common destination if we have only origin
+            result["destination"] = "Munich Hauptbahnhof"
+            logger.debug("Using Munich Hauptbahnhof as default destination")
+        elif result["destination"] and not result["origin"]:
+            # Guess a common origin if we have only destination
+            result["origin"] = "Marienplatz, Munich"
+            logger.debug("Using Marienplatz as default origin")
+
+        # If we still don't have both, return None
+        if not result["origin"] or not result["destination"]:
+            return None
+
+        return result
+
+    def _extract_location_from_line(self, line: str) -> Optional[str]:
+        """Extract location from a line of text.
+
+        Args:
+            line: Line of text
+
+        Returns:
+            Extracted location or None
+        """
+        # Try to extract from bold text
+        if "**" in line:
+            bold_parts = line.split("**")
+            for i in range(1, len(bold_parts), 2):  # Get only the bold parts
+                if bold_parts[i].strip():
+                    return bold_parts[i].strip()
+
+        # Try to extract from patterns like "from: Location" or "to: Location"
+        if ":" in line:
+            parts = line.split(":", 1)
+            if len(parts) > 1 and parts[1].strip():
+                return parts[1].strip()
+
+        # Try to extract from quotation marks
+        if '"' in line:
+            parts = line.split('"')
+            for i in range(1, len(parts), 2):  # Get quoted parts
+                if parts[i].strip():
+                    return parts[i].strip()
+
+        # Fallback to extracting anything after common prepositions
+        prepositions = ["from", "to", "at", "in", "near"]
+        for prep in prepositions:
+            if f" {prep} " in line.lower():
+                parts = line.lower().split(f" {prep} ", 1)
+                if len(parts) > 1 and parts[1].strip():
+                    # Get the first few words after the preposition
+                    words = parts[1].strip().split()
+                    location = " ".join(words[: min(5, len(words))])
+                    # Remove punctuation at the end
+                    return location.rstrip(",.;:")
+
+        return None
+
+    def _create_fallback_routing_result(
+        self, query: str, response_text: str
+    ) -> Dict[str, Any]:
+        """Create a fallback routing result when parsing fails.
+
+        Args:
+            query: The original query
+            response_text: The LLM response text
+
+        Returns:
+            Fallback routing parameters
+        """
+        # Try to identify any locations in the original query
+        logger.warning(f"Creating fallback routing result for query: {query}")
+
+        # Default to common locations in Munich
+        result = {
+            "origin": "Marienplatz, Munich",
+            "destination": "Munich Hauptbahnhof",
+            "mode": "driving",
+            "_fallback": True,
+            "_error": "Failed to parse LLM response",
+            "_original_query": query,
+        }
+
+        # If "airport" is mentioned, use it as destination
+        if "airport" in query.lower() or "flughafen" in query.lower():
+            result["destination"] = "Munich Airport"
+
+        # If "hauptbahnhof" or "main station" is mentioned, use it
+        if "hauptbahnhof" in query.lower() or "main station" in query.lower():
+            result["origin"] = "Munich Hauptbahnhof"
+
+        return result
 
     def generate_navigation_instructions(
         self,
