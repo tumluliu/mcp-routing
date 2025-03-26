@@ -11,7 +11,26 @@ import uuid
 import json
 import asyncio
 import shutil
+import traceback
 from pathlib import Path
+from loguru import logger
+
+# Configure loguru
+logger.remove()  # Remove default handler
+logger.add(
+    "logs/mcp_routing.log",
+    rotation="10 MB",
+    retention="1 week",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} - {message}",
+    level="DEBUG",
+    backtrace=True,
+    diagnose=True,
+)
+logger.add(lambda msg: print(msg), level="INFO", format="{level} | {message}")
+
+# Create logs directory if it doesn't exist
+logs_dir = Path("logs")
+logs_dir.mkdir(exist_ok=True)
 
 from .llm import DeepSeekLLM
 from .routing import get_routing_engine
@@ -21,6 +40,7 @@ from .config import SERVICE_HOST, SERVICE_PORT, RELOAD
 # Create uploads directory if it doesn't exist
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
+logger.info(f"Ensuring uploads directory exists at {UPLOADS_DIR}")
 
 app = FastAPI(
     title="MCP Routing Service",
@@ -39,17 +59,56 @@ app.add_middleware(
 
 # Mount static files directory for uploaded images
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+logger.info("Static files directory mounted at /uploads")
 
 # Initialize services
+logger.info("Initializing LLM service...")
 llm = DeepSeekLLM()
 try:
+    logger.info("Initializing routing engine...")
     routing_engine = get_routing_engine()
+    logger.info(f"Routing engine initialized: {type(routing_engine).__name__}")
 except ValueError as e:
-    print(f"Warning: Routing engine initialization error: {e}")
+    logger.error(f"Routing engine initialization error: {e}")
     # Fallback to prevent server from failing to start
     from .routing import DummyRoutingEngine
 
     routing_engine = DummyRoutingEngine()
+    logger.warning("Fallback to DummyRoutingEngine due to initialization error")
+
+
+# Add middleware to log request information
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log incoming requests and their processing time."""
+    start_time = asyncio.get_event_loop().time()
+
+    # Generate a request ID
+    request_id = str(uuid.uuid4())
+
+    # Log the request
+    logger.info(f"Request {request_id} - {request.method} {request.url.path}")
+
+    try:
+        # Process the request
+        response = await call_next(request)
+
+        # Calculate processing time
+        process_time = asyncio.get_event_loop().time() - start_time
+
+        # Log the response
+        logger.info(
+            f"Request {request_id} completed - Status: {response.status_code} - Time: {process_time:.3f}s"
+        )
+
+        return response
+    except Exception as e:
+        # Log the exception
+        logger.error(f"Request {request_id} failed: {str(e)}")
+        logger.error(f"Exception details: {traceback.format_exc()}")
+
+        # Re-raise the exception to let FastAPI handle it
+        raise
 
 
 class RoutingQuery(BaseModel):
@@ -133,13 +192,21 @@ async def stream_processor(response, query_type):
                             # Send a progress update
                             yield f"data: {json.dumps({'type': 'thinking', 'content': content})}\n\n"
                 except json.JSONDecodeError:
+                    logger.warning(
+                        f"Failed to decode JSON in streaming response: {data}"
+                    )
                     continue
         except Exception as e:
+            logger.error(f"Error processing streaming response: {str(e)}")
+            logger.error(traceback.format_exc())
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
             break
 
     # Send complete message
     yield f"data: {json.dumps({'type': 'complete', 'content': full_text})}\n\n"
+    logger.debug(
+        f"Stream processing complete for {query_type} query. Full response length: {len(full_text)}"
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -948,6 +1015,7 @@ async def upload_image(file: UploadFile = File(...)):
         ImageUploadResult: Result of the upload operation
     """
     try:
+        logger.info(f"Processing image upload: {file.filename}")
         # Generate a unique filename
         filename = f"{uuid.uuid4()}_{file.filename}"
         file_path = UPLOADS_DIR / filename
@@ -956,6 +1024,8 @@ async def upload_image(file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        logger.info(f"Image saved to {file_path}")
+
         return ImageUploadResult(
             image_path=str(file_path),
             image_url=f"/uploads/{filename}",
@@ -963,6 +1033,8 @@ async def upload_image(file: UploadFile = File(...)):
             message="Image uploaded successfully",
         )
     except Exception as e:
+        logger.error(f"Image upload failed: {str(e)}")
+        logger.error(traceback.format_exc())
         return ImageUploadResult(
             image_path="",
             image_url="",
@@ -982,11 +1054,14 @@ async def route(query_data: RoutingQuery):
         RoutingResult: The routing result
     """
     try:
+        logger.info(f"Processing routing query: {query_data.query}")
         # Ensure we have a conversation ID
         conversation_id = query_data.conversation_id or str(uuid.uuid4())
+        logger.debug(f"Using conversation ID: {conversation_id}")
 
         # Check if we need to stream the response
         if query_data.stream:
+            logger.debug("Streaming response requested")
             # Get streaming response
             stream_data = llm.parse_routing_query(
                 query_data.query,
@@ -1002,18 +1077,25 @@ async def route(query_data: RoutingQuery):
             )
 
         # Parse the natural language query
+        logger.debug("Parsing routing query with LLM")
         parsed_params = llm.parse_routing_query(
             query_data.query, conversation_id, image_path=query_data.image_path
         )
+        logger.debug(f"Parsed parameters: {parsed_params}")
 
         # Check for required parameters
         if "origin" not in parsed_params or "destination" not in parsed_params:
+            error_msg = "Could not extract origin and destination from query"
+            logger.error(error_msg)
             raise HTTPException(
                 status_code=400,
-                detail="Could not extract origin and destination from query",
+                detail=error_msg,
             )
 
         # Get routing data
+        logger.debug(
+            f"Requesting route from {parsed_params['origin']} to {parsed_params['destination']}"
+        )
         route_data = routing_engine.route(
             origin=parsed_params["origin"],
             destination=parsed_params["destination"],
@@ -1021,9 +1103,11 @@ async def route(query_data: RoutingQuery):
             waypoints=parsed_params.get("waypoints"),
             avoid=parsed_params.get("avoid"),
         )
+        logger.debug(f"Route data received: {len(route_data.get('steps', []))} steps")
 
         # Generate navigation instructions (stream or not based on query_data.stream)
         if query_data.stream:
+            logger.debug("Streaming navigation instructions")
             # Get streaming response for navigation instructions
             stream_data = llm.generate_navigation_instructions(
                 route_data, conversation_id, stream_response=True
@@ -1036,19 +1120,23 @@ async def route(query_data: RoutingQuery):
             )
         else:
             # Generate without streaming
+            logger.debug("Generating navigation instructions")
             instructions = llm.generate_navigation_instructions(
                 route_data, conversation_id
             )
+            logger.debug(f"Generated {len(instructions)} instructions")
 
         # Create map visualization
+        logger.debug("Creating route map visualization")
         map_path = create_route_map(route_data, instructions)
         map_url = f"/map/{os.path.basename(map_path)}"
+        logger.info(f"Map created: {map_url}")
 
         # Store the map path temporarily
         app.state.temp_maps = getattr(app.state, "temp_maps", {})
         app.state.temp_maps[os.path.basename(map_path)] = map_path
 
-        return RoutingResult(
+        result = RoutingResult(
             query=query_data.query,
             parsed_params=parsed_params,
             route_data=route_data,
@@ -1056,9 +1144,19 @@ async def route(query_data: RoutingQuery):
             map_url=map_url,
             conversation_id=conversation_id,
         )
+        logger.info(
+            f"Route query completed successfully. Conversation ID: {conversation_id}"
+        )
+        return result
 
+    except HTTPException:
+        # Re-raise HTTP exceptions as they are already formatted properly
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error processing routing query: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.post("/chat")
@@ -1072,11 +1170,14 @@ async def chat(query_data: ChatQuery):
         ChatResult or StreamingResponse: The chat response
     """
     try:
+        logger.info(f"Processing chat message: {query_data.message}")
         # Ensure we have a conversation ID
         conversation_id = query_data.conversation_id or str(uuid.uuid4())
+        logger.debug(f"Using conversation ID: {conversation_id}")
 
         # Check if we need to stream the response
         if query_data.stream:
+            logger.debug("Streaming response requested")
             # Get streaming response
             stream_data = llm.chat(
                 query_data.message,
@@ -1092,9 +1193,11 @@ async def chat(query_data: ChatQuery):
             )
 
         # Process the chat message without streaming
+        logger.debug("Processing chat message with LLM")
         response = llm.chat(
             query_data.message, conversation_id, image_path=query_data.image_path
         )
+        logger.debug(f"Chat response received, length: {len(response)}")
 
         # Determine if this might be a routing query
         is_routing_query = False
@@ -1124,16 +1227,24 @@ async def chat(query_data: ChatQuery):
         message_lower = query_data.message.lower()
         if any(keyword in message_lower for keyword in routing_keywords):
             is_routing_query = True
+            logger.debug("Message identified as potential routing query")
 
-        return ChatResult(
+        result = ChatResult(
             message=query_data.message,
             response=response,
             conversation_id=conversation_id,
             is_routing_query=is_routing_query,
         )
+        logger.info(
+            f"Chat query completed successfully. Conversation ID: {conversation_id}"
+        )
+        return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error processing chat: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.get("/map/{map_id}", response_class=HTMLResponse)
@@ -1146,22 +1257,36 @@ async def get_map(map_id: str):
     Returns:
         HTMLResponse: The HTML map
     """
-    temp_maps = getattr(app.state, "temp_maps", {})
-    map_path = temp_maps.get(map_id)
+    try:
+        logger.info(f"Retrieving map: {map_id}")
+        temp_maps = getattr(app.state, "temp_maps", {})
+        map_path = temp_maps.get(map_id)
 
-    if not map_path or not os.path.exists(map_path):
-        raise HTTPException(status_code=404, detail="Map not found")
+        if not map_path or not os.path.exists(map_path):
+            error_msg = "Map not found"
+            logger.warning(f"Map not found: {map_id}")
+            raise HTTPException(status_code=404, detail=error_msg)
 
-    with open(map_path, "r") as f:
-        map_html = f.read()
+        with open(map_path, "r") as f:
+            map_html = f.read()
 
-    return HTMLResponse(content=map_html)
+        logger.debug(f"Map retrieved successfully: {map_id}")
+        return HTMLResponse(content=map_html)
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        error_msg = f"Error retrieving map: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 def start_server():
     """Start the FastAPI server."""
     import uvicorn
 
+    logger.info(f"Starting server on {SERVICE_HOST}:{SERVICE_PORT} (reload={RELOAD})")
     uvicorn.run(
         "mcp_routing.api:app", host=SERVICE_HOST, port=SERVICE_PORT, reload=RELOAD
     )

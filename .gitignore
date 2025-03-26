@@ -10,3 +10,4 @@
 *.pyd
 *.pyw
 *.pyz
+logs/

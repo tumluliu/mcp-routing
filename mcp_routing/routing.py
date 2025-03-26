@@ -4,6 +4,8 @@ import json
 import requests
 from typing import Dict, List, Optional, Any, Union, Tuple
 import polyline
+import traceback
+from loguru import logger
 
 from .config import (
     ROUTING_ENGINE,
@@ -28,6 +30,8 @@ class RoutingEngine:
         """
         # In a real implementation, this would use a geocoding service
         # For this PoC, we'll use a simplified version that works with Munich's major locations
+
+        logger.debug(f"Geocoding location: {location}")
 
         # Dictionary of known Munich locations
         munich_locations = {
@@ -59,6 +63,7 @@ class RoutingEngine:
         # Check for exact matches
         for name, coords in munich_locations.items():
             if name in location_lower or location_lower in name:
+                logger.debug(f"Location match found: {name} -> {coords}")
                 return coords
 
         # If no match found, generate a pseudo-random point in Munich's bounding box
@@ -82,6 +87,9 @@ class RoutingEngine:
             MUNICH_BBOX["max_lon"] - MUNICH_BBOX["min_lon"]
         )
 
+        logger.debug(
+            f"No exact match found for '{location}'. Generated coordinates: ({lat}, {lon})"
+        )
         return (lat, lon)
 
     def route(
@@ -107,6 +115,7 @@ class OSRMEngine(RoutingEngine):
             endpoint: OSRM API endpoint
         """
         self.endpoint = endpoint
+        logger.info(f"Initialized OSRM engine with endpoint: {endpoint}")
 
     def route(
         self,
@@ -128,57 +137,85 @@ class OSRMEngine(RoutingEngine):
         Returns:
             Routing data
         """
-        # Convert addresses to coordinates if needed
-        if isinstance(origin, str):
-            origin = self.geocode(origin)
+        try:
+            logger.info(f"OSRM routing from {origin} to {destination} with mode {mode}")
 
-        if isinstance(destination, str):
-            destination = self.geocode(destination)
+            # Convert addresses to coordinates if needed
+            if isinstance(origin, str):
+                origin = self.geocode(origin)
+                logger.debug(f"Geocoded origin to: {origin}")
 
-        # Process waypoints if any
-        waypoint_coords = []
-        if waypoints:
-            for wp in waypoints:
-                if isinstance(wp, str):
-                    waypoint_coords.append(self.geocode(wp))
-                else:
-                    waypoint_coords.append(wp)
+            if isinstance(destination, str):
+                destination = self.geocode(destination)
+                logger.debug(f"Geocoded destination to: {destination}")
 
-        # Build coordinates string (OSRM uses lon,lat order)
-        coords = [f"{origin[1]},{origin[0]}"]
+            # Process waypoints if any
+            waypoint_coords = []
+            if waypoints:
+                logger.debug(f"Processing {len(waypoints)} waypoints")
+                for wp in waypoints:
+                    if isinstance(wp, str):
+                        wp_coords = self.geocode(wp)
+                        logger.debug(f"Geocoded waypoint '{wp}' to {wp_coords}")
+                        waypoint_coords.append(wp_coords)
+                    else:
+                        waypoint_coords.append(wp)
 
-        if waypoint_coords:
-            for wp in waypoint_coords:
-                coords.append(f"{wp[1]},{wp[0]}")
+            # Build coordinates string (OSRM uses lon,lat order)
+            coords = [f"{origin[1]},{origin[0]}"]
 
-        coords.append(f"{destination[1]},{destination[0]}")
+            if waypoint_coords:
+                for wp in waypoint_coords:
+                    coords.append(f"{wp[1]},{wp[0]}")
 
-        # Map mode to OSRM profile
-        profile_map = {"driving": "car", "walking": "foot", "cycling": "bike"}
-        profile = profile_map.get(mode.lower(), "car")
+            coords.append(f"{destination[1]},{destination[0]}")
 
-        # Build URL
-        coords_str = ";".join(coords)
-        url = f"{self.endpoint}/route/v1/{profile}/{coords_str}"
+            # Map mode to OSRM profile
+            profile_map = {"driving": "car", "walking": "foot", "cycling": "bike"}
+            profile = profile_map.get(mode.lower(), "car")
+            logger.debug(f"Using OSRM profile: {profile}")
 
-        # Add optional parameters
-        params = {
-            "overview": "full",
-            "geometries": "polyline",
-            "steps": "true",
-            **{k: v for k, v in kwargs.items() if v is not None},
-        }
+            # Build URL
+            coords_str = ";".join(coords)
+            url = f"{self.endpoint}/route/v1/{profile}/{coords_str}"
+            logger.debug(f"OSRM API URL: {url}")
 
-        # Make request
-        response = requests.get(url, params=params)
+            # Add optional parameters
+            params = {
+                "overview": "full",
+                "geometries": "polyline",
+                "steps": "true",
+                **{k: v for k, v in kwargs.items() if v is not None},
+            }
+            logger.debug(f"OSRM API parameters: {params}")
 
-        if response.status_code != 200:
-            raise Exception(f"OSRM API error: {response.status_code} - {response.text}")
+            # Make request
+            logger.debug(f"Making request to OSRM API: {url}")
+            response = requests.get(url, params=params)
 
-        route_data = response.json()
+            if response.status_code != 200:
+                logger.error(
+                    f"OSRM API error: {response.status_code} - {response.text}"
+                )
+                raise Exception(
+                    f"OSRM API error: {response.status_code} - {response.text}"
+                )
 
-        # Process and standardize the response
-        return self._standardize_response(route_data, origin, destination)
+            route_data = response.json()
+            logger.debug(f"OSRM API response received: {len(str(route_data))} bytes")
+
+            # Process and standardize the response
+            result = self._standardize_response(route_data, origin, destination)
+            logger.info(
+                f"OSRM routing completed: {result['distance']:.1f}m, {result['duration']:.1f}s"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"OSRM routing error: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Re-raise the exception for proper handling
+            raise
 
     def _standardize_response(
         self,
@@ -196,7 +233,10 @@ class OSRMEngine(RoutingEngine):
         Returns:
             Standardized routing data
         """
+        logger.debug("Standardizing OSRM response")
+
         if not route_data.get("routes"):
+            logger.error("No routes found in OSRM response")
             raise Exception("No routes found in OSRM response")
 
         route = route_data["routes"][0]
@@ -205,6 +245,7 @@ class OSRMEngine(RoutingEngine):
         geometry = polyline.decode(route["geometry"])
         # Convert to [lat, lon] format
         geometry = [(point[0], point[1]) for point in geometry]
+        logger.debug(f"Decoded route geometry with {len(geometry)} points")
 
         # Process steps
         steps = []
@@ -218,6 +259,7 @@ class OSRMEngine(RoutingEngine):
                         "name": step.get("name", ""),
                     }
                 )
+        logger.debug(f"Processed {len(steps)} route steps")
 
         return {
             "distance": route["distance"],
@@ -248,6 +290,10 @@ class OpenRouteServiceEngine(RoutingEngine):
         if api_key:
             self.headers["Authorization"] = api_key
 
+        logger.info(f"Initialized OpenRouteService engine with endpoint: {endpoint}")
+        if not api_key:
+            logger.warning("No API key provided for OpenRouteService")
+
     def route(
         self,
         origin: Union[str, Tuple[float, float]],
@@ -270,79 +316,104 @@ class OpenRouteServiceEngine(RoutingEngine):
         Returns:
             Routing data
         """
-        # Convert addresses to coordinates if needed
-        if isinstance(origin, str):
-            origin = self.geocode(origin)
+        try:
+            logger.info(f"ORS routing from {origin} to {destination} with mode {mode}")
 
-        if isinstance(destination, str):
-            destination = self.geocode(destination)
+            # Convert addresses to coordinates if needed
+            if isinstance(origin, str):
+                origin = self.geocode(origin)
+                logger.debug(f"Geocoded origin to: {origin}")
 
-        # Process waypoints if any
-        waypoint_coords = []
-        if waypoints:
-            for wp in waypoints:
-                if isinstance(wp, str):
-                    waypoint_coords.append(self.geocode(wp))
-                else:
-                    waypoint_coords.append(wp)
+            if isinstance(destination, str):
+                destination = self.geocode(destination)
+                logger.debug(f"Geocoded destination to: {destination}")
 
-        # Build coordinates array (ORS uses [lon, lat] order)
-        coordinates = [[origin[1], origin[0]]]
+            # Process waypoints if any
+            waypoint_coords = []
+            if waypoints:
+                logger.debug(f"Processing {len(waypoints)} waypoints")
+                for wp in waypoints:
+                    if isinstance(wp, str):
+                        wp_coords = self.geocode(wp)
+                        logger.debug(f"Geocoded waypoint '{wp}' to {wp_coords}")
+                        waypoint_coords.append(wp_coords)
+                    else:
+                        waypoint_coords.append(wp)
 
-        if waypoint_coords:
-            for wp in waypoint_coords:
-                coordinates.append([wp[1], wp[0]])
+            # Build coordinates array (ORS uses [lon, lat] order)
+            coordinates = [[origin[1], origin[0]]]
 
-        coordinates.append([destination[1], destination[0]])
+            if waypoint_coords:
+                for wp in waypoint_coords:
+                    coordinates.append([wp[1], wp[0]])
 
-        # Map mode to ORS profile
-        profile_map = {
-            "driving": "driving-car",
-            "walking": "foot-walking",
-            "cycling": "cycling-regular",
-        }
-        profile = profile_map.get(mode.lower(), "driving-car")
+            coordinates.append([destination[1], destination[0]])
 
-        # Map avoid parameters
-        avoid_features = []
-        if avoid:
-            feature_map = {
-                "tolls": "tollways",
-                "highways": "highways",
-                "ferries": "ferries",
+            # Map mode to ORS profile
+            profile_map = {
+                "driving": "driving-car",
+                "walking": "foot-walking",
+                "cycling": "cycling-regular",
             }
-            avoid_features = [
-                feature_map.get(item, item) for item in avoid if item in feature_map
-            ]
+            profile = profile_map.get(mode.lower(), "driving-car")
+            logger.debug(f"Using ORS profile: {profile}")
 
-        # Build request body
-        payload = {
-            "coordinates": coordinates,
-            "instructions": True,
-            "format": "geojson",
-        }
+            # Map avoid parameters
+            avoid_features = []
+            if avoid:
+                feature_map = {
+                    "tolls": "tollways",
+                    "highways": "highways",
+                    "ferries": "ferries",
+                }
+                avoid_features = [
+                    feature_map.get(item, item) for item in avoid if item in feature_map
+                ]
+                logger.debug(f"Avoid features: {avoid_features}")
 
-        if avoid_features:
-            payload["options"] = {"avoid_features": avoid_features}
+            # Build request body
+            payload = {
+                "coordinates": coordinates,
+                "instructions": True,
+                "format": "geojson",
+            }
 
-        # Add other parameters if provided
-        for key, value in kwargs.items():
-            if value is not None:
-                payload[key] = value
+            if avoid_features:
+                payload["options"] = {"avoid_features": avoid_features}
 
-        # Make request
-        url = f"{self.endpoint}/v2/directions/{profile}/geojson"
-        response = requests.post(url, headers=self.headers, json=payload)
+            # Add other parameters if provided
+            for key, value in kwargs.items():
+                if value is not None:
+                    payload[key] = value
 
-        if response.status_code != 200:
-            raise Exception(
-                f"OpenRouteService API error: {response.status_code} - {response.text}"
+            logger.debug(f"ORS API payload: {payload}")
+
+            # Make request
+            url = f"{self.endpoint}/v2/directions/{profile}/geojson"
+            logger.debug(f"Making request to ORS API: {url}")
+            response = requests.post(url, headers=self.headers, json=payload)
+
+            if response.status_code != 200:
+                logger.error(f"ORS API error: {response.status_code} - {response.text}")
+                raise Exception(
+                    f"OpenRouteService API error: {response.status_code} - {response.text}"
+                )
+
+            route_data = response.json()
+            logger.debug(f"ORS API response received: {len(str(route_data))} bytes")
+
+            # Process and standardize the response
+            result = self._standardize_response(route_data, origin, destination)
+            logger.info(
+                f"ORS routing completed: {result['distance']:.1f}m, {result['duration']:.1f}s"
             )
+            return result
 
-        route_data = response.json()
-
-        # Process and standardize the response
-        return self._standardize_response(route_data, origin, destination)
+        except Exception as e:
+            logger.error(f"OpenRouteService routing error: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Re-raise the exception for proper handling
+            raise
 
     def _standardize_response(
         self,
@@ -360,7 +431,10 @@ class OpenRouteServiceEngine(RoutingEngine):
         Returns:
             Standardized routing data
         """
+        logger.debug("Standardizing ORS response")
+
         if not route_data.get("features"):
+            logger.error("No routes found in OpenRouteService response")
             raise Exception("No routes found in OpenRouteService response")
 
         route = route_data["features"][0]
@@ -370,6 +444,7 @@ class OpenRouteServiceEngine(RoutingEngine):
         geometry_coords = route["geometry"]["coordinates"]
         # Convert to [lat, lon] format
         geometry = [(coord[1], coord[0]) for coord in geometry_coords]
+        logger.debug(f"Processed route geometry with {len(geometry)} points")
 
         # Process steps
         steps = []
@@ -384,6 +459,7 @@ class OpenRouteServiceEngine(RoutingEngine):
                             "name": step.get("name", ""),
                         }
                     )
+        logger.debug(f"Processed {len(steps)} route steps")
 
         return {
             "distance": properties.get("summary", {}).get("distance", 0),
@@ -404,16 +480,21 @@ def get_routing_engine(engine_name: str = ROUTING_ENGINE) -> RoutingEngine:
     Returns:
         Routing engine instance
     """
+    logger.info(f"Initializing routing engine: {engine_name}")
+
     if engine_name.lower() == "osrm":
+        logger.info(f"Creating OSRM engine with endpoint: {OSRM_ENDPOINT}")
         return OSRMEngine()
     elif engine_name.lower() == "openrouteservice":
+        logger.info(f"Creating OpenRouteService engine with endpoint: {ORS_ENDPOINT}")
         return OpenRouteServiceEngine()
     elif engine_name.lower() == "dummy":
+        logger.info("Creating DummyRoutingEngine")
         return DummyRoutingEngine()
     else:
         # Default to DummyRoutingEngine if the specified engine is not supported
-        print(
-            f"Warning: Unsupported routing engine: {engine_name}. Using DummyRoutingEngine instead."
+        logger.warning(
+            f"Unsupported routing engine: {engine_name}. Using DummyRoutingEngine instead."
         )
         return DummyRoutingEngine()
 
@@ -423,9 +504,77 @@ class DummyRoutingEngine:
 
     def __init__(self):
         """Initialize the dummy routing engine."""
-        print(
-            "WARNING: Using DummyRoutingEngine. This should only be used for testing."
+        logger.warning(
+            "Initializing DummyRoutingEngine. This should only be used for testing."
         )
+
+    def geocode(self, location: str) -> Tuple[float, float]:
+        """Convert a location string to coordinates.
+
+        Args:
+            location: Location string (address)
+
+        Returns:
+            (latitude, longitude) tuple
+        """
+        # Use the same implementation as the base RoutingEngine class
+        logger.debug(f"DummyRoutingEngine geocoding: {location}")
+
+        # Munich center coordinates (Marienplatz)
+        munich_center = [48.1371, 11.5754]
+
+        # Dictionary of known Munich locations (copy from base class)
+        munich_locations = {
+            "marienplatz": (48.1373, 11.5754),
+            "hauptbahnhof": (48.1402, 11.5600),
+            "olympiapark": (48.1698, 11.5516),
+            "englischer garten": (48.1642, 11.6056),
+            "allianz arena": (48.2188, 11.6248),
+            "deutsches museum": (48.1299, 11.5834),
+            "viktualienmarkt": (48.1348, 11.5765),
+            "odeonsplatz": (48.1424, 11.5765),
+            "frauenkirche": (48.1385, 11.5733),
+            "bmw welt": (48.1771, 11.5562),
+            "munich airport": (48.3537, 11.7750),
+            "sendlinger tor": (48.1342, 11.5666),
+            "karlsplatz": (48.1399, 11.5655),
+        }
+
+        # Simplistic lookup
+        location_lower = location.lower()
+
+        # Check for exact matches
+        for name, coords in munich_locations.items():
+            if name in location_lower or location_lower in name:
+                logger.debug(
+                    f"DummyRoutingEngine location match found: {name} -> {coords}"
+                )
+                return coords
+
+        # If no match found, generate coordinates near Munich center
+        import hashlib
+        import struct
+
+        # Use a hash of the input to generate a deterministic but "random" point
+        hash_val = hashlib.md5(location_lower.encode()).digest()
+        lat_ratio, lon_ratio = struct.unpack("ff", hash_val[:8])
+
+        # Ensure the values are between 0 and 1
+        lat_ratio = abs(lat_ratio) % 1.0
+        lon_ratio = abs(lon_ratio) % 1.0
+
+        # Map to Munich's bounding box
+        lat = MUNICH_BBOX["min_lat"] + lat_ratio * (
+            MUNICH_BBOX["max_lat"] - MUNICH_BBOX["min_lat"]
+        )
+        lon = MUNICH_BBOX["min_lon"] + lon_ratio * (
+            MUNICH_BBOX["max_lon"] - MUNICH_BBOX["min_lon"]
+        )
+
+        logger.debug(
+            f"DummyRoutingEngine generated coordinates for '{location}': ({lat}, {lon})"
+        )
+        return (lat, lon)
 
     def route(
         self,
@@ -451,73 +600,121 @@ class DummyRoutingEngine:
         Returns:
             Dummy routing data in standardized format
         """
-        # Munich center coordinates (Marienplatz)
-        munich_center = [48.1371, 11.5754]
+        try:
+            logger.info(
+                f"DummyRoutingEngine routing from {origin} to {destination} with mode {mode}"
+            )
 
-        # Fake route geometry (circular route around Munich center)
-        geometry = []
-        for i in range(21):
-            angle = i * 0.1
-            lat = munich_center[0] + 0.01 * angle * (1 if i % 2 == 0 else -1)
-            lon = munich_center[1] + 0.01 * angle * (1 if i % 3 == 0 else -1)
-            geometry.append([lat, lon])
+            # Munich center coordinates (Marienplatz)
+            munich_center = [48.1371, 11.5754]
 
-        # Fake steps for the route
-        steps = [
-            {
-                "name": "Start Street",
-                "instruction": "Start from origin",
-                "distance": 100,
-                "duration": 60,
-            },
-            {
-                "name": "Main Street",
-                "instruction": "Continue on Main Street",
-                "distance": 500,
-                "duration": 300,
-            },
-            {
-                "name": "Central Avenue",
-                "instruction": "Turn right onto Central Avenue",
-                "distance": 800,
-                "duration": 480,
-            },
-            {
-                "name": "Destination Road",
-                "instruction": "Arrive at destination",
-                "distance": 200,
-                "duration": 120,
-            },
-        ]
+            # Process origin and destination to handle different input formats
+            if isinstance(origin, (list, tuple)):
+                origin_coords = origin[:2]
+                logger.debug(f"Using provided origin coordinates: {origin_coords}")
+            else:
+                # For string addresses, geocode them
+                origin_coords = self.geocode(origin)
+                logger.debug(f"Geocoded origin '{origin}' to: {origin_coords}")
 
-        # Process origin and destination to handle different input formats
-        if isinstance(origin, (list, tuple)):
-            origin_coords = origin[:2]
-        else:
-            # For string addresses, use dummy coordinates near Munich center
-            origin_coords = [munich_center[0] - 0.01, munich_center[1] - 0.01]
+            if isinstance(destination, (list, tuple)):
+                dest_coords = destination[:2]
+                logger.debug(f"Using provided destination coordinates: {dest_coords}")
+            else:
+                # For string addresses, geocode them
+                dest_coords = self.geocode(destination)
+                logger.debug(f"Geocoded destination '{destination}' to: {dest_coords}")
 
-        if isinstance(destination, (list, tuple)):
-            dest_coords = destination[:2]
-        else:
-            # For string addresses, use dummy coordinates near Munich center
-            dest_coords = [munich_center[0] + 0.01, munich_center[1] + 0.01]
+            # Process waypoints
+            if waypoints:
+                logger.debug(
+                    f"Processing {len(waypoints)} waypoints (dummy implementation)"
+                )
 
-        # Return standardized route data
-        return {
-            "origin": origin_coords,
-            "destination": dest_coords,
-            "distance": 1600,  # meters
-            "duration": 960,  # seconds
-            "mode": mode,
-            "geometry": geometry,
-            "steps": steps,
-            "waypoints": waypoints or [],
-            "summary": "Dummy route from origin to destination",
-            "bounds": {
+            # Generate fake route geometry (circular route around Munich center)
+            geometry = []
+            for i in range(21):
+                angle = i * 0.1
+                lat = munich_center[0] + 0.01 * angle * (1 if i % 2 == 0 else -1)
+                lon = munich_center[1] + 0.01 * angle * (1 if i % 3 == 0 else -1)
+                geometry.append([lat, lon])
+            logger.debug(f"Generated dummy route with {len(geometry)} points")
+
+            # Fake steps for the route
+            steps = [
+                {
+                    "name": "Start Street",
+                    "instruction": "Start from origin",
+                    "distance": 100,
+                    "duration": 60,
+                },
+                {
+                    "name": "Main Street",
+                    "instruction": "Continue on Main Street",
+                    "distance": 500,
+                    "duration": 300,
+                },
+                {
+                    "name": "Central Avenue",
+                    "instruction": "Turn right onto Central Avenue",
+                    "distance": 800,
+                    "duration": 480,
+                },
+                {
+                    "name": "Destination Road",
+                    "instruction": "Arrive at destination",
+                    "distance": 200,
+                    "duration": 120,
+                },
+            ]
+
+            # Calculate bounds
+            bounds = {
                 "min_lat": min(p[0] for p in geometry),
                 "max_lat": max(p[0] for p in geometry),
                 "min_lon": min(p[1] for p in geometry),
                 "max_lon": max(p[1] for p in geometry),
-            },
-        }
+            }
+
+            result = {
+                "origin": origin_coords,
+                "destination": dest_coords,
+                "distance": 1600,  # meters
+                "duration": 960,  # seconds
+                "mode": mode,
+                "geometry": geometry,
+                "steps": steps,
+                "waypoints": waypoints or [],
+                "summary": "Dummy route from origin to destination",
+                "bounds": bounds,
+            }
+
+            logger.info(
+                f"DummyRoutingEngine generated route: {result['distance']}m, {result['duration']}s"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"DummyRoutingEngine error: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Generate minimal valid response even in case of error
+            return {
+                "origin": [48.1371, 11.5754],
+                "destination": [48.1471, 11.5854],
+                "distance": 1000,
+                "duration": 600,
+                "geometry": [
+                    [48.1371, 11.5754],
+                    [48.1421, 11.5804],
+                    [48.1471, 11.5854],
+                ],
+                "steps": [
+                    {
+                        "name": "Error Route",
+                        "instruction": "Route generation failed",
+                        "distance": 1000,
+                        "duration": 600,
+                    }
+                ],
+                "summary": "Error in route generation",
+            }
