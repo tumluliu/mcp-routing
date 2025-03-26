@@ -8,8 +8,19 @@ import os
 import traceback
 from loguru import logger
 import re
+import time
+from PIL import Image
+import io
+from pathlib import Path
 
-from .config import DEEPSEEK_ENDPOINT, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
+from .config import (
+    DEEPSEEK_ENDPOINT,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
+    MUNICH_CENTER,
+    DEFAULT_SEARCH_RADIUS,
+)
+from .places import PlaceSearchService, parse_fuzzy_location
 
 
 class DeepSeekLLM:
@@ -39,6 +50,9 @@ class DeepSeekLLM:
 
         # Initialize conversation contexts storage
         self.conversations = {}
+
+        # Initialize place search service
+        self.place_search_service = PlaceSearchService()
 
         logger.info(
             f"Initialized DeepSeekLLM with model: {model}, endpoint: {endpoint}"
@@ -220,6 +234,11 @@ class DeepSeekLLM:
             logger.info(f"Query includes image: {image_path}")
 
         try:
+            # Check if the query contains fuzzy location references
+            if self._is_fuzzy_location_query(query):
+                logger.info("Detected fuzzy location query")
+                return self._handle_fuzzy_location_query(query, conversation_id)
+
             # Ensure conversation exists
             if conversation_id:
                 conversation_id = self.create_conversation(conversation_id)
@@ -1050,3 +1069,598 @@ class DeepSeekLLM:
         except Exception as e:
             logger.error(f"Error updating conversation with stream response: {str(e)}")
             logger.error(traceback.format_exc())
+
+    def _is_fuzzy_location_query(self, query: str) -> bool:
+        """Determine if a query contains fuzzy location references.
+
+        Args:
+            query: The routing query
+
+        Returns:
+            True if the query contains fuzzy location references
+        """
+        # Keywords that indicate potential fuzzy location queries
+        fuzzy_indicators = [
+            "restaurant",
+            "cafe",
+            "bar",
+            "coffee",
+            "food",
+            "place to eat",
+            "place to drink",
+            "pub",
+            "hotel",
+            "accommodation",
+            "place to stay",
+            "good",
+            "best",
+            "nice",
+            "great",
+            "popular",
+            "recommended",
+            "close to",
+            "near",
+            "around",
+            "by",
+            "in the area",
+        ]
+
+        query_lower = query.lower()
+
+        # Check if query contains any fuzzy indicators
+        return any(indicator in query_lower for indicator in fuzzy_indicators)
+
+    def _handle_fuzzy_location_query(
+        self, query: str, conversation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Handle a query with fuzzy location references.
+
+        Args:
+            query: The routing query
+            conversation_id: Optional conversation ID for context
+
+        Returns:
+            Dictionary of structured routing parameters
+        """
+        logger.info("Processing fuzzy location query")
+
+        # 1. First, process the query with standard LLM to get high-level structure
+        # This gives us information about origin, rough destination area, and travel mode
+        standard_params = self._extract_routing_params_with_llm(query, conversation_id)
+
+        if not standard_params:
+            logger.warning("Failed to extract any routing parameters with LLM")
+            return {"origin": None, "destination": None, "mode": "driving"}
+
+        # 2. Check if destination contains fuzzy references
+        destination = standard_params.get("destination", "")
+        if not destination:
+            logger.warning("No destination found in query")
+            return standard_params
+
+        # 3. Parse the fuzzy location query to extract the category and reference location
+        category, reference_location, attributes = parse_fuzzy_location(destination)
+        logger.debug(
+            f"Parsed fuzzy query: category={category}, location={reference_location}, attributes={attributes}"
+        )
+
+        if not category:
+            # If we couldn't extract a distinct category, just return standard params
+            logger.debug("No distinct category found in destination")
+            return standard_params
+
+        # If we don't have a reference location but have a category, the entire destination
+        # might be just a category, like "a good restaurant"
+        if not reference_location and category:
+            # Try to determine a logical reference point (e.g., city center, near the origin)
+            reference_location = self._determine_reference_location(
+                standard_params, query
+            )
+            logger.info(f"Determined reference location: {reference_location}")
+
+        # 4. Search for places matching the category near the reference location
+        logger.info(f"Searching for {category} near {reference_location}")
+
+        # Determine search radius based on the mode of transport
+        mode = standard_params.get("mode", "driving")
+        search_radius = self._determine_search_radius(mode)
+
+        # Search for places
+        place_search = self.place_search_service
+        places = place_search.search_nearby(
+            category=category,
+            near_location=reference_location or "Munich",
+            radius=search_radius,
+            limit=5,  # Get top 5 results for better selection
+        )
+
+        if not places:
+            logger.warning(f"No places found for {category} near {reference_location}")
+            return standard_params
+
+        # 5. Select the best place based on attributes
+        selected_place = self._select_place_by_attributes(places, attributes)
+        logger.info(f"Selected place: {selected_place['name']}")
+
+        # 6. Update the parameters with the specific place
+        result = standard_params.copy()
+        result["destination"] = selected_place["name"]
+        result["destination_coords"] = selected_place["coordinates"]
+        result["fuzzy_resolution"] = {
+            "original_query": destination,
+            "resolved_to": selected_place["name"],
+            "category": category,
+            "attributes": attributes,
+            "reference_location": reference_location,
+            "all_places": [
+                {"name": p["name"], "category": p.get("category", category)}
+                for p in places[:3]
+            ],
+        }
+
+        return result
+
+    def _determine_reference_location(
+        self, routing_params: Dict[str, Any], query: str
+    ) -> str:
+        """Determine a reasonable reference location when none is explicitly specified.
+
+        Args:
+            routing_params: The routing parameters extracted so far
+            query: The original query
+
+        Returns:
+            A reference location
+        """
+        # 1. First try to use origin as reference point
+        origin = routing_params.get("origin")
+        if origin:
+            return origin
+
+        # 2. Check for city/neighborhood mentions in the query
+        # Define Munich neighborhoods and areas in a more maintainable way
+        munich_areas = [
+            "marienplatz",
+            "city center",
+            "downtown",
+            "central",
+            "centrum",
+            "old town",
+            "altstadt",
+            "schwabing",
+            "haidhausen",
+            "sendling",
+            "neuhausen",
+            "bogenhausen",
+            "lehel",
+            "maxvorstadt",
+            "ludwigsvorstadt",
+            "giesing",
+            "english garden",
+            "olympic park",
+            "odeonsplatz",
+            "karlsplatz",
+            "stachus",
+            "viktualienmarkt",
+            "isarvorstadt",
+            "glockenbachviertel",
+            "westend",
+            "ostbahnhof",
+            "hauptbahnhof",
+            "main station",
+            "central station",
+        ]
+
+        query_lower = query.lower()
+        for area in munich_areas:
+            if area in query_lower:
+                return area
+
+        # 3. Default to city center
+        return "Munich City Center"
+
+    def _determine_search_radius(self, mode: str) -> int:
+        """Determine appropriate search radius based on transportation mode.
+
+        Args:
+            mode: Transportation mode (driving, walking, cycling)
+
+        Returns:
+            Search radius in meters
+        """
+        # Use the default search radius from the config
+        return DEFAULT_SEARCH_RADIUS.get(mode.lower(), DEFAULT_SEARCH_RADIUS["default"])
+
+    def _select_place_by_attributes(
+        self, places: List[Dict[str, Any]], attributes: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Select the best place based on attributes using a sophisticated scoring algorithm.
+
+        Args:
+            places: List of places with details
+            attributes: Dictionary of attributes and their weights/values
+
+        Returns:
+            The selected place
+        """
+        # If only one place, return it
+        if len(places) == 1:
+            return places[0]
+
+        # Log the selection process
+        attribute_list = attributes.get("general", [])
+        logger.debug(
+            f"Selecting place from {len(places)} options based on attributes: {attribute_list}"
+        )
+
+        # Define score weights for different factors
+        weights = {
+            "cuisine_match": 50,  # 50% importance to cuisine matching - increased priority
+            "proximity": 20,  # 20% importance to proximity - reduced priority
+            "category_match": 10,  # 10% importance to category matching
+            "attribute_match": 15,  # 15% importance to attribute matching
+            "name_quality": 5,  # 5% importance to name features
+        }
+
+        # Store scores for each place
+        place_scores = []
+
+        # Check for cuisine emphasis in attributes
+        cuisine_emphasis = False
+        cuisine_type = None
+
+        # Check if authenticity is mentioned
+        if "authentic" in attribute_list or "traditional" in attribute_list:
+            cuisine_emphasis = True
+            # Try to identify cuisine type from query
+            if "bavarian" in attribute_list or "german" in attribute_list:
+                cuisine_type = "bavarian"
+            elif "italian" in attribute_list:
+                cuisine_type = "italian"
+            elif "chinese" in attribute_list:
+                cuisine_type = "chinese"
+            elif "mexican" in attribute_list:
+                cuisine_type = "mexican"
+            # Add more cuisine types as needed
+
+        for i, place in enumerate(places):
+            scores = {
+                "cuisine_match": 0,
+                "proximity": 0,
+                "category_match": 0,
+                "attribute_match": 0,
+                "name_quality": 0,
+            }
+
+            # Get place tags and name
+            tags = place.get("tags", {})
+            name_lower = place["name"].lower()
+
+            # 1. Cuisine match score - NEW!
+            cuisine_score = 0
+            place_cuisine = tags.get("cuisine", "").lower()
+
+            # If we know the desired cuisine type and this place has cuisine info
+            if cuisine_type and place_cuisine:
+                # Perfect match for explicitly requested cuisine type
+                if cuisine_type == place_cuisine:
+                    cuisine_score = 100
+                # Partial match (e.g., regional when bavarian was requested)
+                elif (
+                    cuisine_type == "bavarian"
+                    and place_cuisine in ["regional", "german"]
+                ) or (
+                    cuisine_type == "german"
+                    and place_cuisine in ["bavarian", "regional"]
+                ):
+                    cuisine_score = 80
+                # Completely wrong cuisine with authenticity requested should score very low
+                elif cuisine_emphasis:
+                    cuisine_score = 10  # Heavy penalty for incorrect cuisine
+                else:
+                    cuisine_score = 30  # Some penalty but not as severe
+            # If authenticity matters but cuisine is unknown
+            elif cuisine_emphasis:
+                # Check name for cuisine clues if tag is missing
+                if cuisine_type == "bavarian" and any(
+                    term in name_lower
+                    for term in [
+                        "augustiner",
+                        "franziskaner",
+                        "hofbräu",
+                        "löwenbräu",
+                        "paulaner",
+                    ]
+                ):
+                    cuisine_score = 70
+                else:
+                    cuisine_score = 40  # Unknown cuisine is better than wrong cuisine
+            else:
+                # Default score when cuisine isn't specified
+                cuisine_score = 50
+
+            scores["cuisine_match"] = cuisine_score
+
+            # 2. Proximity score (inversely proportional to distance)
+            # Normalize to 0-100 range where 100 is closest
+            min_distance = min(p["distance"] for p in places)
+            max_distance = max(p["distance"] for p in places)
+            if max_distance > min_distance:
+                normalized_distance = (place["distance"] - min_distance) / (
+                    max_distance - min_distance
+                )
+                scores["proximity"] = 100 * (1 - normalized_distance)
+            else:
+                scores["proximity"] = 100  # If all places at same distance
+
+            # 3. Category matching score - simplified since we've already filtered by category
+            category_lower = place.get("category", "").lower()
+            scores["category_match"] = (
+                80  # Base score since category was already matched
+            )
+
+            # Bonus for exact category match
+            if places[0].get("category", "").lower() == category_lower:
+                scores["category_match"] += 20
+
+            # 4. Attribute matching score based on detected attributes
+            attribute_score = 0
+
+            # Quality score based on attribute counts
+            if attributes["quality"] > 0:
+                # Name quality heuristics (in a real system, would use ratings)
+                quality_terms = [
+                    "gourmet",
+                    "fine",
+                    "authentic",
+                    "traditional",
+                    "premium",
+                    "quality",
+                    "speciality",
+                    "special",
+                    "award",
+                    "chef",
+                    "signature",
+                    "craft",
+                    "house",
+                    "famous",
+                    "best",
+                    "popular",
+                ]
+                if any(term in name_lower for term in quality_terms):
+                    attribute_score += 20
+
+                # Bonus for places with longer, more specific names
+                if len(name_lower.split()) >= 3:
+                    attribute_score += 10
+
+            # Cost score
+            if attributes["cost"] > 0:
+                cost_detected = False
+                # Check if we're looking for expensive places
+                if (
+                    "expensive" in attribute_list
+                    or "luxury" in attribute_list
+                    or "upscale" in attribute_list
+                ):
+                    expensive_indicators = [
+                        "gourmet",
+                        "fine dining",
+                        "deluxe",
+                        "premium",
+                        "house",
+                    ]
+                    if any(ind in name_lower for ind in expensive_indicators):
+                        attribute_score += 20
+                        cost_detected = True
+
+                # Check if we're looking for cheap places
+                elif (
+                    "cheap" in attribute_list
+                    or "affordable" in attribute_list
+                    or "budget" in attribute_list
+                ):
+                    budget_indicators = [
+                        "express",
+                        "fast",
+                        "quick",
+                        "budget",
+                        "value",
+                        "economic",
+                    ]
+                    if any(ind in name_lower for ind in budget_indicators):
+                        attribute_score += 20
+                        cost_detected = True
+
+                # If no specific cost attribute was detected but cost was important
+                if not cost_detected:
+                    attribute_score += 5  # Minor bonus
+
+            # Authenticity score
+            if attributes["authenticity"] > 0:
+                authenticity_terms = [
+                    "authentic",
+                    "traditional",
+                    "original",
+                    "real",
+                    "genuine",
+                    "local",
+                ]
+
+                # Check for authenticity in name
+                if any(term in name_lower for term in authenticity_terms):
+                    attribute_score += 25
+
+                # Direct OSM tag authenticity match (cuisine-specific)
+                if cuisine_type and place_cuisine and cuisine_type == place_cuisine:
+                    attribute_score += 40  # Strong bonus for matching cuisine
+                # Penalize mismatched cuisines when authenticity requested
+                elif cuisine_type and place_cuisine and cuisine_type != place_cuisine:
+                    attribute_score -= 30  # Strong penalty for wrong cuisine
+
+            # Speed/Service score
+            if attributes["speed"] > 0:
+                speed_terms = ["express", "quick", "fast", "rapid", "speedy", "prompt"]
+                if any(term in name_lower for term in speed_terms):
+                    attribute_score += 25
+
+            # Atmosphere score
+            if attributes["atmosphere"] > 0:
+                atmosphere_terms = [
+                    "cozy",
+                    "quiet",
+                    "romantic",
+                    "family",
+                    "friendly",
+                    "casual",
+                    "elegant",
+                ]
+                if any(term in name_lower for term in atmosphere_terms):
+                    attribute_score += 20
+
+            # Food quality score
+            if attributes["food_quality"] > 0:
+                food_terms = [
+                    "delicious",
+                    "tasty",
+                    "fresh",
+                    "healthy",
+                    "organic",
+                    "gourmet",
+                    "specialty",
+                ]
+                if any(term in name_lower for term in food_terms):
+                    attribute_score += 20
+
+            # Normalize attribute score to 0-100
+            scores["attribute_match"] = min(100, max(0, attribute_score * 2))
+
+            # 5. Name quality - prefer names with good descriptors
+            name_quality_score = 50  # Base score
+            positive_terms = [
+                "best",
+                "favorite",
+                "original",
+                "authentic",
+                "special",
+                "famous",
+                "house",
+                "traditional",
+                "quality",
+                "gourmet",
+                "craft",
+            ]
+            if any(term in name_lower for term in positive_terms):
+                name_quality_score += 30
+
+            # Avoid generic names
+            generic_terms = ["restaurant", "café", "cafe", "bar", "bistro"]
+            if name_lower in generic_terms or len(name_lower.split()) == 1:
+                name_quality_score -= 20
+
+            scores["name_quality"] = max(0, min(100, name_quality_score))
+
+            # Calculate weighted total score
+            total_score = sum(
+                score * (weights[category] / 100) for category, score in scores.items()
+            )
+
+            # Log detailed score breakdown
+            logger.debug(f"Place: {place['name']}")
+            logger.debug(
+                f"  Cuisine type: {place_cuisine}, Match score: {scores['cuisine_match']:.1f}"
+            )
+            logger.debug(
+                f"  Distance: {place['distance']:.0f}m - Proximity score: {scores['proximity']:.1f}"
+            )
+            logger.debug(f"  Category match score: {scores['category_match']:.1f}")
+            logger.debug(f"  Attribute match score: {scores['attribute_match']:.1f}")
+            logger.debug(f"  Name quality score: {scores['name_quality']:.1f}")
+            logger.debug(f"  Total weighted score: {total_score:.1f}")
+
+            place_scores.append((place, total_score))
+
+        # Sort by total score descending
+        place_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Log selection result
+        best_place, best_score = place_scores[0]
+        logger.info(f"Selected place: {best_place['name']} with score {best_score:.1f}")
+
+        return best_place
+
+    def _extract_routing_params_with_llm(
+        self, query: str, conversation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Extract routing parameters using the LLM.
+
+        Args:
+            query: The routing query
+            conversation_id: Optional conversation ID for context
+
+        Returns:
+            Dictionary of structured routing parameters
+        """
+        # Create a modified system prompt that handles fuzzy locations
+        system_prompt = """
+        You are a helpful assistant that converts natural language routing queries into structured parameters.
+        Extract the origin, destination, and any other relevant parameters from the query.
+        For addresses in Munich, return detailed information.
+        
+        If the destination includes a category like "restaurant", "cafe", etc., include that in the destination field.
+        For example, if the query is "how to get to a good restaurant near Marienplatz", the destination should be
+        "a good restaurant near Marienplatz".
+        
+        IMPORTANT: You MUST return your response ONLY as a valid JSON object with these fields:
+        - origin: Origin location (address or coordinates)
+        - destination: Destination location (address, coordinates, or category + location)
+        - mode: Transportation mode (default: "driving")
+        - waypoints: List of intermediate waypoints (optional)
+        - avoid: List of features to avoid (optional)
+        - departure_time: Departure time (optional)
+        - arrival_time: Arrival time (optional)
+        
+        DO NOT provide explanations, details, or any other text outside of the JSON object.
+        DO NOT use markdown formatting. ONLY return a valid JSON object.
+        
+        All addresses should be formatted properly for Munich, Germany.
+        """
+
+        # Construct messages
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add conversation history if available
+        if conversation_id:
+            conversation_id = self.create_conversation(conversation_id)
+            conversation_history = self.conversations.get(conversation_id, [])
+            messages.extend(conversation_history)
+
+        # Add the user query
+        messages.append({"role": "user", "content": query})
+
+        # Call LLM API
+        response = self._call_api(messages)
+        response_text = response["choices"][0]["message"]["content"]
+
+        # Extract JSON from response
+        try:
+            result = None
+
+            # Try direct JSON parsing
+            try:
+                json_str = response_text
+                if "```json" in response_text:
+                    json_str = response_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in response_text:
+                    json_str = response_text.split("```")[1].split("```")[0].strip()
+
+                result = json.loads(json_str)
+            except (json.JSONDecodeError, IndexError):
+                # Fallback to text extraction
+                result = self._extract_routing_info_from_text(response_text)
+
+            return result or {}
+
+        except Exception as e:
+            logger.error(f"Error extracting routing parameters: {e}")
+            return {}

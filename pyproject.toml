@@ -19,6 +19,7 @@ transformers = "^4.38.0"
 python-multipart = "^0.0.20"
 loguru = "^0.7.3"
 marked = "^0.9.1"
+pillow = "^11.1.0"
 
 [build-system]
 requires = ["poetry-core"]

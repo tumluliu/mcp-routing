@@ -139,6 +139,7 @@ class RoutingResult(BaseModel):
     instructions: List[str]
     map_url: str
     conversation_id: str
+    fuzzy_resolution: Optional[Dict[str, Any]] = None
 
 
 class ChatResult(BaseModel):
@@ -712,6 +713,22 @@ async def root():
                 text-decoration: underline;
             }
             
+            .fuzzy-resolution {
+                margin-top: 15px;
+                padding-top: 10px;
+                border-top: 1px dashed var(--gray-medium);
+            }
+            
+            .fuzzy-detail {
+                font-size: 14px;
+                margin: 5px 0;
+            }
+            
+            .highlight {
+                color: var(--primary-color);
+                font-weight: 500;
+            }
+            
             /* Responsive adjustments */
             @media (max-width: 768px) {
                 .main-container {
@@ -1023,7 +1040,8 @@ async def root():
                             const distance = (routeData.route_data.distance / 1000).toFixed(1);
                             const duration = Math.round(routeData.route_data.duration / 60);
                             
-                            document.getElementById('result').innerHTML = `
+                            // Construct result HTML
+                            let resultHTML = `
                                 <div class="result-card">
                                     <h3>Route Found</h3>
                                     <div class="card-info">
@@ -1035,10 +1053,25 @@ async def root():
                                             <div class="info-label">Duration</div>
                                             <div class="info-value duration">${duration} min</div>
                                         </div>
-                                    </div>
-                                    <a href="${routeData.map_url}" target="_blank" class="map-link">Open map in new window</a>
-                                </div>
-                            `;
+                                    </div>`;
+                            
+                            // Add fuzzy resolution info if available
+                            if (routeData.fuzzy_resolution) {
+                                const fuzzy = routeData.fuzzy_resolution;
+                                resultHTML += `
+                                    <div class="fuzzy-resolution">
+                                        <div class="info-label">Destination Resolution</div>
+                                        <div class="fuzzy-detail">Found: <span class="highlight">${fuzzy.resolved_to}</span></div>
+                                        <div class="fuzzy-detail">Category: ${fuzzy.category}</div>
+                                        ${fuzzy.attributes.length > 0 ? 
+                                            `<div class="fuzzy-detail">Attributes: ${fuzzy.attributes.join(', ')}</div>` : ''}
+                                    </div>`;
+                            }
+                            
+                            resultHTML += `<a href="${routeData.map_url}" target="_blank" class="map-link">Open map in new window</a>
+                                </div>`;
+                            
+                            document.getElementById('result').innerHTML = resultHTML;
                             
                             // Display instructions
                             const instructionsDiv = document.getElementById('instructions');
@@ -1168,13 +1201,30 @@ async def route(query_data: RoutingQuery):
                 detail=error_msg,
             )
 
+        # Store any fuzzy resolution information
+        fuzzy_resolution = parsed_params.pop("fuzzy_resolution", None)
+        if fuzzy_resolution:
+            logger.info(
+                f"Fuzzy location resolved to: {fuzzy_resolution['resolved_to']}"
+            )
+
         # Get routing data
         logger.debug(
             f"Requesting route from {parsed_params['origin']} to {parsed_params['destination']}"
         )
+
+        # Use coordinates directly if available from fuzzy resolution
+        if "destination_coords" in parsed_params:
+            logger.debug(
+                f"Using resolved coordinates for destination: {parsed_params['destination_coords']}"
+            )
+            destination = parsed_params.pop("destination_coords")
+        else:
+            destination = parsed_params["destination"]
+
         route_data = routing_engine.route(
             origin=parsed_params["origin"],
-            destination=parsed_params["destination"],
+            destination=destination,
             mode=parsed_params.get("mode", "driving"),
             waypoints=parsed_params.get("waypoints"),
             avoid=parsed_params.get("avoid"),
@@ -1219,6 +1269,7 @@ async def route(query_data: RoutingQuery):
             instructions=instructions,
             map_url=map_url,
             conversation_id=conversation_id,
+            fuzzy_resolution=fuzzy_resolution,
         )
         logger.info(
             f"Route query completed successfully. Conversation ID: {conversation_id}"

@@ -13,6 +13,7 @@ from .config import (
     ORS_ENDPOINT,
     ORS_API_KEY,
     MUNICH_BBOX,
+    MUNICH_CENTER,
 )
 from .geocoding import NominatimGeocoder
 
@@ -25,85 +26,60 @@ class RoutingEngine:
         self.geocoder = NominatimGeocoder()
         logger.info("Initialized RoutingEngine with NominatimGeocoder")
 
-    def geocode(self, location: str) -> Tuple[float, float]:
+    def geocode(self, location: Union[str, Tuple[float, float]]) -> Tuple[float, float]:
         """Convert a location string to coordinates.
 
         Args:
-            location: Location string (address)
+            location: Location string (address) or coordinates tuple
 
         Returns:
             (latitude, longitude) tuple
         """
+        # If location is already coordinates, just return it
+        if isinstance(location, tuple) and len(location) == 2:
+            try:
+                # Validate that these are valid coordinates
+                if isinstance(location[0], (int, float)) and isinstance(
+                    location[1], (int, float)
+                ):
+                    logger.debug(f"Using provided coordinates: {location}")
+                    return location
+            except (IndexError, TypeError):
+                logger.warning(f"Invalid coordinates provided: {location}")
+                pass  # Fall through to regular geocoding
+
+        if not isinstance(location, str):
+            logger.warning(
+                f"Unexpected location type: {type(location)}. Converting to string."
+            )
+            location = str(location)
+
         logger.debug(f"Geocoding location: {location}")
 
         # Try to geocode using Nominatim
         coords = self.geocoder.geocode(location)
         if coords:
+            logger.info(f"Successfully geocoded '{location}' to {coords}")
             return coords
 
-        # If Nominatim fails, fall back to hardcoded locations
-        logger.warning(f"Falling back to hardcoded locations for: {location}")
+        # If geocoding fails, attempt to recover with more general search
+        logger.warning(f"Primary geocoding failed for: {location}")
 
-        # Dictionary of known Munich locations (as fallback)
-        munich_locations = {
-            "marienplatz": (48.1373, 11.5754),
-            "hauptbahnhof": (48.1402, 11.5600),
-            "olympiapark": (48.1698, 11.5516),
-            "englischer garten": (48.1642, 11.6056),
-            "allianz arena": (48.2188, 11.6248),
-            "deutsches museum": (48.1299, 11.5834),
-            "viktualienmarkt": (48.1348, 11.5765),
-            "odeonsplatz": (48.1424, 11.5765),
-            "frauenkirche": (48.1385, 11.5733),
-            "bmw welt": (48.1771, 11.5562),
-            "munich airport": (48.3537, 11.7750),
-            "sendlinger tor": (48.1342, 11.5666),
-            "karlsplatz": (48.1399, 11.5655),
-            "technische universität münchen": (48.1497, 11.5680),
-            "ludwig maximilians universität": (48.1507, 11.5801),
-            "olympic stadium": (48.1731, 11.5465),
-            "hofbräuhaus": (48.1379, 11.5797),
-            "nymphenburg palace": (48.1583, 11.5033),
-            "olympia einkaufszentrum": (48.1828, 11.5358),
-            "tierpark hellabrunn": (48.0784, 11.5554),
-        }
-
-        # Simplistic lookup
-        location_lower = location.lower()
-
-        # Check for exact matches
-        for name, coords in munich_locations.items():
-            if name in location_lower or location_lower in name:
-                logger.debug(
-                    f"Location match found in hardcoded list: {name} -> {coords}"
-                )
+        # Try geocoding with Munich added explicitly
+        if "munich" not in location.lower() and "münchen" not in location.lower():
+            munich_location = f"{location}, Munich"
+            logger.debug(f"Trying with city added: {munich_location}")
+            coords = self.geocoder.geocode(munich_location)
+            if coords:
+                logger.info(f"Successfully geocoded '{munich_location}' to {coords}")
                 return coords
 
-        # If no match found, generate a pseudo-random point in Munich's bounding box
-        # This is just for demonstration - a real implementation would use proper geocoding
-        import hashlib
-        import struct
+        # If all geocoding attempts failed, log a warning and fall back to Munich center
+        logger.warning(f"All geocoding attempts failed for: {location}")
+        logger.info(f"Falling back to Munich city center")
 
-        # Use a hash of the input to generate a deterministic but "random" point
-        hash_val = hashlib.md5(location_lower.encode()).digest()
-        lat_ratio, lon_ratio = struct.unpack("ff", hash_val[:8])
-
-        # Ensure the values are between 0 and 1
-        lat_ratio = abs(lat_ratio) % 1.0
-        lon_ratio = abs(lon_ratio) % 1.0
-
-        # Map to Munich's bounding box
-        lat = MUNICH_BBOX["min_lat"] + lat_ratio * (
-            MUNICH_BBOX["max_lat"] - MUNICH_BBOX["min_lat"]
-        )
-        lon = MUNICH_BBOX["min_lon"] + lon_ratio * (
-            MUNICH_BBOX["max_lon"] - MUNICH_BBOX["min_lon"]
-        )
-
-        logger.warning(
-            f"No exact match found for '{location}'. Generated coordinates: ({lat}, {lon})"
-        )
-        return (lat, lon)
+        # Use the Munich center coordinates from config
+        return MUNICH_CENTER
 
     def route(
         self,
